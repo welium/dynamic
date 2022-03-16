@@ -13,8 +13,7 @@ import torch
 import torchvision
 import tqdm
 
-import echonet
-
+echonet = __import__(__name__.split('.')[0])
 
 @click.command("segmentation")
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
@@ -96,6 +95,10 @@ def run(
             Defaults to 20.
         seed (int, optional): Seed for random number generator. Defaults to 0.
     """
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+    num_of_gpus = torch.cuda.device_count()
+    print("Available gpus: " + str(num_of_gpus))
+
 
     # Seed RNGs
     np.random.seed(seed)
@@ -109,6 +112,7 @@ def run(
     # Set device for computations
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Using " + str(device) + " for training")
 
     # Set up model
     model = torchvision.models.segmentation.__dict__[model_name](pretrained=pretrained, aux_loss=False)
@@ -171,7 +175,7 @@ def run(
                 ds = dataset[phase]
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
-
+                print("Running epoch: {}, split: {}".format(epoch, split))
                 loss, large_inter, large_union, small_inter, small_union = echonet.utils.segmentation.run_epoch(model, dataloader, phase == "train", optim, device)
                 overall_dice = 2 * (large_inter.sum() + small_inter.sum()) / (large_union.sum() + large_inter.sum() + small_union.sum() + small_inter.sum())
                 large_dice = 2 * large_inter.sum() / (large_union.sum() + large_inter.sum())
@@ -216,6 +220,7 @@ def run(
                 dataset = echonet.datasets.Echo(root=data_dir, split=split, **kwargs)
                 dataloader = torch.utils.data.DataLoader(dataset,
                                                          batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
+                print("Running epoch: {}, split: {}".format(checkpoint["epoch"], split))
                 loss, large_inter, large_union, small_inter, small_union = echonet.utils.segmentation.run_epoch(model, dataloader, False, None, device)
 
                 overall_dice = 2 * (large_inter + small_inter) / (large_union + large_inter + small_union + small_inter)
