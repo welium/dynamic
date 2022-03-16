@@ -120,8 +120,8 @@ def run(
     num_of_gpus = torch.cuda.device_count()
     print("Available gpus: " + str(num_of_gpus))
 
-    y_mean = 43.3 #calculated elsewhere
-    y_std = 36 #calculated elsewhere
+    y_mean = 55.32 #calculated elsewhere
+    y_std = 12.70 #calculated elsewhere
 
     # Seed RNGs
     np.random.seed(seed)
