@@ -41,6 +41,7 @@ echonet = __import__(__name__.split('.')[0])
 @click.option("--samp_ssl", type=int, default=3)
 @click.option("--w_aliv", type=int, default=1)
 @click.option("--samp_fq", type=int, default=1)
+@click.option("--model_name", type=str, default='r2plus1d_unc')
 def run(
     data_dir=None,
     output=None,
@@ -67,7 +68,8 @@ def run(
     seed=0,
     drop_rate = 0.2,
     val_samp=1,
-    samp_fq = 10
+    samp_fq = 10,
+    model_name='r2plus1d_unc'
 ):
     """Trains/tests EF prediction model.
 
@@ -120,7 +122,7 @@ def run(
     # Seed RNGs
     np.random.seed(seed)
     torch.manual_seed(seed)
-    model_name = "r2plus1d_unc"
+    model_name = model_name
     # Set default output directory
     if output is None:
         output = os.path.join("output", "video", "{}_{}_{}_{}".format(model_name, frames, period, "pretrained" if pretrained else "random"))
@@ -174,7 +176,7 @@ def run(
               }
 
     # Set up datasets and dataloaders
-    multiplier = 8 # Labelled dataset is 1/8 of unlabelled dataset
+    multiplier = 7 # Labelled dataset is 1/8 of unlabelled dataset
     dataset = {}
     dataset_train = {}
     dataset_train["labelled"] = echonet.datasets.Echo(root=data_dir, split="train", **kwargs, pad=12, multiplier = multiplier)
