@@ -68,7 +68,8 @@ class Echo(torchvision.datasets.VisionDataset):
                  pad=None,
                  noise=None,
                  target_transform=None,
-                 external_test_location=None):
+                 external_test_location=None,
+                 multiplier=None):
         if root is None:
             root = echonet.config.DATA_DIR
 
@@ -101,6 +102,13 @@ class Echo(torchvision.datasets.VisionDataset):
 
             if self.split != "ALL":
                 data = data[data["Split"] == self.split]
+
+            print("Split {}, Total Samples is {}".format(self.split, len(data)))
+            if multiplier is not None:
+                data_columns = data.columns
+                data = pandas.DataFrame(np.repeat(data.values,multiplier,axis=0))
+                data.columns = data_columns
+                print("Split {}, Total Samples is {} after repeating to expand".format(self.split, len(data)))
 
             self.header = data.columns.tolist()
             self.fnames = data["FileName"].tolist()

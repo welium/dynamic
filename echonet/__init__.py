@@ -9,7 +9,7 @@ import click
 from .__version__ import __version__
 from .config import CONFIG as config
 from . import datasets
-from .utils import original as utils
+from .utils import new as utils
 
 
 @click.group()
