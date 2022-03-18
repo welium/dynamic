@@ -15,7 +15,7 @@ import tqdm
 
 echonet = __import__(__name__.split('.')[0])
 
-@click.command("segmentation")
+@click.command("segmentation_new")
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
 @click.option("--output", type=click.Path(file_okay=False), default=None)
 @click.option("--model_name", type=click.Choice(

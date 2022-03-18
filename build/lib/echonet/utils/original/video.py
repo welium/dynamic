@@ -104,7 +104,6 @@ def run(
             Defaults to 20.
         seed (int, optional): Seed for random number generator. Defaults to 0.
     """
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
     num_of_gpus = torch.cuda.device_count()
     print("Available gpus: " + str(num_of_gpus))
 
@@ -186,7 +185,7 @@ def run(
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
                 print("Running epoch: {}, split: {}".format(epoch, phase))
-                loss, yhat, y = echonet.utils.video.run_epoch(model, dataloader, phase == "train", optim, device)
+                loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device)
                 f.write("{},{},{},{},{},{},{},{},{}\n".format(epoch,
                                                               phase,
                                                               loss,
@@ -230,7 +229,7 @@ def run(
                 dataloader = torch.utils.data.DataLoader(
                     echonet.datasets.Echo(root=data_dir, split=split, **kwargs),
                     batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"))
-                loss, yhat, y = echonet.utils.video.run_epoch(model, dataloader, False, None, device)
+                loss, yhat, y = run_epoch(model, dataloader, False, None, device)
                 f.write("{} (one clip) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.r2_score)))
                 f.write("{} (one clip) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_absolute_error)))
                 f.write("{} (one clip) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_squared_error)))))
@@ -240,7 +239,7 @@ def run(
                 ds = echonet.datasets.Echo(root=data_dir, split=split, **kwargs, clips="all")
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=1, num_workers=0, shuffle=False, pin_memory=(device.type == "cuda"))
-                loss, yhat, y = echonet.utils.video.run_epoch(model, dataloader, False, None, device, save_all=True, block_size=batch_size)
+                loss, yhat, y = run_epoch(model, dataloader, False, None, device, save_all=True, block_size=batch_size)
                 f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
                 f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
                 f.write("{} (all clips) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_squared_error)))))

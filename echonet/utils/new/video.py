@@ -17,7 +17,7 @@ from .models import r2plus1d_18_unc
 echonet = __import__(__name__.split('.')[0])
 
 
-@click.command("video")
+@click.command("video_new")
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
 @click.option("--output", type=click.Path(file_okay=False), default=None)
 @click.option("--task", type=str, default="EF")
@@ -30,8 +30,7 @@ echonet = __import__(__name__.split('.')[0])
 @click.option("--lr_step_period", type=int, default=15)
 @click.option("--frames", type=int, default=32)
 @click.option("--period", type=int, default=2)
-@click.option("--num_train_patients", type=int, default=None)
-@click.option("--num_workers", type=int, default=4)
+@click.option("--num_workers", type=int, default=8)
 @click.option("--batch_size", type=int, default=20)
 @click.option("--device", type=str, default=None)
 @click.option("--seed", type=int, default=0)
@@ -61,8 +60,7 @@ def run(
     lr_step_period=15,
     frames=32,
     period=2,
-    num_train_patients=None,
-    num_workers=4,
+    num_workers=8,
     batch_size=20,
     device=None,
     seed=0,
@@ -356,7 +354,7 @@ def run(
 
             scheduler.step()
             scheduler_1.step()
-
+            best_model_loss = float('inf')
             if loss_valit_1 < loss_valit:
                 best_model_loss = loss_valit_1
                 best_weights = model_1.state_dict()
@@ -368,9 +366,10 @@ def run(
             save = {
                 'epoch': epoch,
                 'state_dict': model.state_dict(),
+                'state_dict_1': model_1.state_dict(),
                 'period': period,
                 'frames': frames,
-                'best_loss': bestLoss,
+                'best_loss': best_model_loss,
                 'best_weights': best_weights,
                 'loss': loss,
                 'r2': r2_value,
@@ -390,8 +389,8 @@ def run(
         # Load best weights
         if num_epochs != 0:
             checkpoint = torch.load(os.path.join(output, "best.pt"))
-            model.load_state_dict(checkpoint['state_dict'])
-            f.write("Best validation loss {} from epoch {}, R2 {}\n".format(checkpoint["best_model_loss"], checkpoint["epoch"], checkpoint["r2"]))
+            model.load_state_dict(checkpoint['best_weights'])
+            f.write("Best validation loss {} from epoch {}, R2 {}\n".format(checkpoint["best_loss"], checkpoint["epoch"], checkpoint["r2"]))
             f.flush()
 
         if run_test:
@@ -400,14 +399,17 @@ def run(
                 # Performance without test-time augmentation
                 for seed_itr in range(1):
                     np.random.seed(seed_itr)
-                    torch.manual_seed(seed_itr)                
+                    torch.manual_seed(seed_itr)
+                    ds = echonet.datasets.Echo(root=data_dir, split=split, **kwargs)                
                     dataloader = torch.utils.data.DataLoader(
-                        echonet.datasets.Echo(root=data_dir, split=split, **kwargs),
-                        batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"))
-
-                    temp = run_epoch_val(model = model, dataloader = dataloader, train = False, optim = None, device = device, save_all=False, block_size=None, y_mean = y_mean, y_std = y_std, samp_fq = samp_fq)
-                    y = temp[1]
-                    yhat = temp[2]
+                        ds,
+                        batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
+                    temp = run_epoch_val(
+                            model = model, dataloader = dataloader, train = False, optim = None, device = device, 
+                            save_all=False, block_size=None, y_mean = y_mean, y_std = y_std, samp_fq = samp_fq
+                            )     
+                    yhat = temp[1]
+                    y = temp[2]
                     f.write("Seed is {}".format(seed_itr))
                     f.write("{} (one clip) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.r2_score)))
                     f.write("{} (one clip) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_absolute_error)))
@@ -415,25 +417,23 @@ def run(
                     f.flush()
 
 
-                    print("With test-time augmentation, split: {}".format(split))
-                    # Performance with test-time augmentation
-                    ds = echonet.datasets.Echo(root=data_dir, split=split, **kwargs, clips="all")
-                    dataloader = torch.utils.data.DataLoader(
-                        ds, batch_size=1, num_workers=0, shuffle=False, pin_memory=(device.type == "cuda"))
-                    # num_workers needs to be 0 or some weird bugs on multithreading would happen in this stage
-                    temp = run_epoch_val(model = model, dataloader = dataloader, train = False, optim = None, device = device, save_all=False, block_size=None, y_mean = y_mean, y_std = y_std, samp_fq = samp_fq)
-                    y = temp[1]
-                    yhat = temp[2]
-                    f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
-                    f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
-                    f.write("{} (all clips) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_squared_error)))))
-                    f.flush()
+                    # # Performance with test-time augmentation
+                    # ds = echonet.datasets.Echo(root=data_dir, split=split, **kwargs, clips="all")
+                    # dataloader = torch.utils.data.DataLoader(
+                    #     ds, batch_size=1, num_workers=0, shuffle=False, pin_memory=(device.type == "cuda"))
+                    # # num_workers needs to be 0 or some weird bugs on multithreading would happen in this stage
+                    # temp = run_epoch_val(model = model, dataloader = dataloader, train = False, optim = None, device = device, save_all=False, block_size=None, y_mean = y_mean, y_std = y_std, samp_fq = samp_fq)
+                    # y = temp[1]
+                    # yhat = temp[2]
+                    # f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
+                    # f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
+                    # f.write("{} (all clips) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_squared_error)))))
+                    # f.flush()
 
                 # Write full performance to file
                 with open(os.path.join(output, "{}_predictions.csv".format(split)), "w") as g:
                     for (filename, pred) in zip(ds.fnames, yhat):
-                        for (i, p) in enumerate(pred):
-                            g.write("{},{},{:.4f}\n".format(filename, i, p))
+                        g.write("{},{},{:.4f}\n".format(filename, 0, pred))
                 echonet.utils.latexify()
                 yhat = np.array(list(map(lambda x: x.mean(), yhat)))
 
@@ -779,6 +779,8 @@ def run_epoch_val(model, dataloader, train, optim, device, save_all=False, block
 
     mean2s_0_stack_ls = np.concatenate(mean2s_0_stack_ls)
     var1s_0_stack_ls = np.concatenate(var1s_0_stack_ls)
+    print("y: ", y)
+    print("yhat: ", yhat)
 
     return total / n, yhat, y, var_hat, var_e, var_a, mean2s_0_stack_ls, var1s_0_stack_ls
 
