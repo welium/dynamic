@@ -35,10 +35,10 @@ echonet = __import__(__name__.split('.')[0])
 @click.option("--device", type=str, default=None)
 @click.option("--seed", type=int, default=0)
 @click.option("--drop_rate", type=float, default=0.2)
-@click.option("--w_cps", type=int, default=1)
+@click.option("--w_cps", type=float, default=1)
 @click.option("--epiunc/--cmbunc", default=False)
 @click.option("--samp_ssl", type=int, default=3)
-@click.option("--w_aliv", type=int, default=1)
+@click.option("--w_aliv", type=float, default=1)
 @click.option("--samp_fq", type=int, default=1)
 @click.option("--model_name", type=str, default='r2plus1d_unc')
 def run(
@@ -60,7 +60,7 @@ def run(
     lr_step_period=15,
     frames=32,
     period=2,
-    num_workers=8,
+    num_workers=12,
     batch_size=20,
     device=None,
     seed=0,
@@ -209,6 +209,10 @@ def run(
             f.write("Starting run from scratch\n")
 
         for epoch in range(epoch_resume, num_epochs):
+            if no_improvement >= 3:
+                print("Early Stopping as there is no improvement")
+                f.write("Early Stopping as there is no improvement\n")
+                break
             print("Epoch #{}".format(epoch), flush=True)
             for phase in ['train', 'val']:
                 start_time = time.time()
@@ -385,6 +389,9 @@ def run(
                 print("saved best because {} < {}".format(best_model_loss, bestLoss))
                 torch.save(save, os.path.join(output, "best.pt"))
                 bestLoss = best_model_loss
+                no_improvement = 0
+            else:
+                no_improvement += 1
 
         # Load best weights
         if num_epochs != 0:
@@ -560,8 +567,8 @@ def run_epoch(model, model_1, dataloader_lb, dataloader_ul, train, optim, optim_
         pseudolabel_0 = means_0_mean
         pseudolabel_1 = means_1_mean
 
-        pseudolabel_mean = pseudolabel_0 * 0.5 + pseudolabel_1 * 0.5
-        var_mean = vars_0_mean * 0.5 + vars_1_mean * 0.5
+        pseudolabel_mean = (pseudolabel_0 + pseudolabel_1) / 2
+        var_mean = (vars_0_mean + vars_1_mean) / 2
 
         # Loss Based on pseudolabel: want low variance and close to mean prediction
         loss_mse_cps_0 = ((output_ul_pred_0.view(-1) - pseudolabel_mean)**2)
@@ -683,7 +690,6 @@ def run_epoch_val(model, dataloader, train, optim, device, save_all=False, block
             Default is None.
     """
 
-    # model.train(False)
     model.train(False)
 
     total = 0  # total training loss

@@ -10,18 +10,15 @@ import numpy as np
 import scipy.signal
 import skimage.draw
 import torch
-import torchvision
 import tqdm
+from .models import deeplabv3_resnet50
 
 echonet = __import__(__name__.split('.')[0])
 
 @click.command("segmentation_new")
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
 @click.option("--output", type=click.Path(file_okay=False), default=None)
-@click.option("--model_name", type=click.Choice(
-    sorted(name for name in torchvision.models.segmentation.__dict__
-           if name.islower() and not name.startswith("__") and callable(torchvision.models.segmentation.__dict__[name]))),
-    default="deeplabv3_resnet50")
+@click.option("--model_name", type=str, default="deeplabv3_ss")
 @click.option("--pretrained/--random", default=False)
 @click.option("--weights", type=click.Path(exists=True, dir_okay=False), default=None)
 @click.option("--run_test/--skip_test", default=False)
@@ -30,11 +27,13 @@ echonet = __import__(__name__.split('.')[0])
 @click.option("--lr", type=float, default=1e-5)
 @click.option("--weight_decay", type=float, default=0)
 @click.option("--lr_step_period", type=int, default=None)
-@click.option("--num_train_patients", type=int, default=None)
-@click.option("--num_workers", type=int, default=4)
+@click.option("--num_workers", type=int, default=16)
 @click.option("--batch_size", type=int, default=20)
 @click.option("--device", type=str, default=None)
 @click.option("--seed", type=int, default=0)
+@click.option("--drop_rate", type=float, default=0.2)
+@click.option("--w_cps", type=float, default=0.5)
+
 def run(
     data_dir=None,
     output=None,
@@ -49,11 +48,12 @@ def run(
     lr=1e-5,
     weight_decay=1e-5,
     lr_step_period=None,
-    num_train_patients=None,
-    num_workers=4,
+    num_workers=8,
     batch_size=20,
     device=None,
     seed=0,
+    drop_rate = 0.2,
+    w_cps=0.5
 ):
     """Trains/tests segmentation model.
 
@@ -95,7 +95,6 @@ def run(
             Defaults to 20.
         seed (int, optional): Seed for random number generator. Defaults to 0.
     """
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
     num_of_gpus = torch.cuda.device_count()
     print("Available gpus: " + str(num_of_gpus))
 
@@ -115,9 +114,8 @@ def run(
         print("Using " + str(device) + " for training")
 
     # Set up model
-    model = torchvision.models.segmentation.__dict__[model_name](pretrained=pretrained, aux_loss=False)
+    model = deeplabv3_resnet50(num_classes = 1, drop_rate = drop_rate)
 
-    model.classifier[-1] = torch.nn.Conv2d(model.classifier[-1].in_channels, 1, kernel_size=model.classifier[-1].kernel_size)  # change number of outputs to 1
     if device.type == "cuda":
         model = torch.nn.DataParallel(model)
     model.to(device)
@@ -127,7 +125,7 @@ def run(
         model.load_state_dict(checkpoint['state_dict'])
 
     # Set up optimizer
-    optim = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    optim = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if lr_step_period is None:
         lr_step_period = math.inf
     scheduler = torch.optim.lr_scheduler.StepLR(optim, lr_step_period)
@@ -141,14 +139,13 @@ def run(
               }
 
     # Set up datasets and dataloaders
+    multiplier = 7 # Labelled dataset is 1/8 of unlabelled dataset
     dataset = {}
-    dataset["train"] = echonet.datasets.Echo(root=data_dir, split="train", **kwargs)
-    if num_train_patients is not None and len(dataset["train"]) > num_train_patients:
-        # Subsample patients (used for ablation experiment)
-        indices = np.random.choice(len(dataset["train"]), num_train_patients, replace=False)
-        dataset["train"] = torch.utils.data.Subset(dataset["train"], indices)
+    dataset_train = {}
+    dataset_train["labelled"] = echonet.datasets.Echo(root=data_dir, split="train", **kwargs, pad=12, multiplier = multiplier)
+    dataset_train["unlabelled"] = echonet.datasets.Echo(root=data_dir, split="train_unlabelled", **kwargs, pad=12)
     dataset["val"] = echonet.datasets.Echo(root=data_dir, split="val", **kwargs)
-
+    dataset["train"] = dataset_train
     # Run training and testing loops
     with open(os.path.join(output, "log.csv"), "a") as f:
         epoch_resume = 0
@@ -164,19 +161,35 @@ def run(
             f.write("Resuming from epoch {}\n".format(epoch_resume))
         except FileNotFoundError:
             f.write("Starting run from scratch\n")
-
+        no_improvement = 0
         for epoch in range(epoch_resume, num_epochs):
+            if no_improvement >= 3:
+                print("Early Stopping as there is no improvement")
+                f.write("Early Stopping as there is no improvement\n")
+                break
             print("Epoch #{}".format(epoch), flush=True)
             for phase in ['train', 'val']:
                 start_time = time.time()
                 for i in range(torch.cuda.device_count()):
                     torch.cuda.reset_peak_memory_stats(i)
-
                 ds = dataset[phase]
-                dataloader = torch.utils.data.DataLoader(
-                    ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
-                print("Running epoch: {}, split: {}".format(epoch, split))
-                loss, large_inter, large_union, small_inter, small_union = echonet.utils.segmentation.run_epoch(model, dataloader, phase == "train", optim, device)
+
+                if phase == 'train':
+                    ds_ul = ds['unlabelled']
+                    dataloader_ul = torch.utils.data.DataLoader(
+                        ds_ul, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
+
+                    ds = ds['labelled']
+                    dataloader = torch.utils.data.DataLoader(
+                        ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
+                    print("Running epoch: {}, split: {}".format(epoch, phase))
+                    loss, large_inter, large_union, small_inter, small_union = run_epoch(model, dataloader, dataloader_ul, phase == "train", optim, device, w_cps=w_cps)
+                else:
+                    dataloader = torch.utils.data.DataLoader(
+                        ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
+                    print("Running epoch: {}, split: {}".format(epoch, phase))
+                    loss, large_inter, large_union, small_inter, small_union = run_epoch_val(model, dataloader, device)
+
                 overall_dice = 2 * (large_inter.sum() + small_inter.sum()) / (large_union.sum() + large_inter.sum() + small_union.sum() + small_inter.sum())
                 large_dice = 2 * large_inter.sum() / (large_union.sum() + large_inter.sum())
                 small_dice = 2 * small_inter.sum() / (small_union.sum() + small_inter.sum())
@@ -207,6 +220,9 @@ def run(
             if loss < bestLoss:
                 torch.save(save, os.path.join(output, "best.pt"))
                 bestLoss = loss
+                no_improvement = 0
+            else: 
+                no_improvement += 1
 
         # Load best weights
         if num_epochs != 0:
@@ -216,12 +232,12 @@ def run(
 
         if run_test:
             # Run on validation and test
-            for split in ["val", "test"]:
+            for split in ["train", "TRAIN_UNLABELLED", "val", "test"]:
                 dataset = echonet.datasets.Echo(root=data_dir, split=split, **kwargs)
                 dataloader = torch.utils.data.DataLoader(dataset,
                                                          batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
                 print("Running epoch: {}, split: {}".format(checkpoint["epoch"], split))
-                loss, large_inter, large_union, small_inter, small_union = echonet.utils.segmentation.run_epoch(model, dataloader, False, None, device)
+                loss, large_inter, large_union, small_inter, small_union = run_epoch_val(model, dataloader, device)
 
                 overall_dice = 2 * (large_inter + small_inter) / (large_union + large_inter + small_union + small_inter)
                 large_dice = 2 * large_inter / (large_union + large_inter)
@@ -363,7 +379,7 @@ def run(
                         start += offset
 
 
-def run_epoch(model, dataloader, train, optim, device):
+def run_epoch(model, dataloader, dataloader_ul, train, optim, device, w_cps = 0.5):
     """Run one epoch of training/evaluation for segmentation.
 
     Args:
@@ -393,7 +409,154 @@ def run_epoch(model, dataloader, train, optim, device):
     small_inter_list = []
     small_union_list = []
 
+    total = min(len(dataloader), len(dataloader_ul))
+    dataloader_iter = iter(dataloader)
+    dataloader_ul_iter = iter(dataloader_ul)
+
     with torch.set_grad_enabled(train):
+        with tqdm.tqdm(total=total) as pbar:
+            for i in range(total):                
+                """
+                Supervised Step Forward
+                """
+                (_, (large_frame, small_frame, large_trace, small_trace)) = dataloader_iter.next()
+                # Count number of pixels in/out of human segmentation
+                pos += (large_trace == 1).sum().item()
+                pos += (small_trace == 1).sum().item()
+                neg += (large_trace == 0).sum().item()
+                neg += (small_trace == 0).sum().item()
+
+                # Count number of pixels in/out of computer segmentation
+                pos_pix += (large_trace == 1).sum(0).to("cpu").detach().numpy()
+                pos_pix += (small_trace == 1).sum(0).to("cpu").detach().numpy()
+                neg_pix += (large_trace == 0).sum(0).to("cpu").detach().numpy()
+                neg_pix += (small_trace == 0).sum(0).to("cpu").detach().numpy()
+
+                # Run prediction for diastolic frames and compute loss
+                large_frame = large_frame.to(device)
+                large_trace = large_trace.to(device)
+                y_large = model(large_frame)
+                loss_large = torch.nn.functional.binary_cross_entropy(y_large["out"][:, 0, :, :], large_trace, reduction="sum")
+                loss_large2 = torch.nn.functional.binary_cross_entropy(y_large["out2"][:, 0, :, :], large_trace, reduction="sum")
+                loss_large3 = torch.nn.functional.binary_cross_entropy(y_large["out3"][:, 0, :, :], large_trace, reduction="sum")
+                loss_large4 = torch.nn.functional.binary_cross_entropy(y_large["out4"][:, 0, :, :], large_trace, reduction="sum")
+                y_large = (y_large["out"] + y_large["out2"] + y_large["out3"] + y_large["out4"]) * 0.25
+                # Compute pixel intersection and union between human and computer segmentations
+                large_inter += np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                large_union += np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                large_inter_list.extend(np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+                large_union_list.extend(np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+                # Run prediction for systolic frames and compute loss
+                small_frame = small_frame.to(device)
+                small_trace = small_trace.to(device)
+                
+                y_small = model(small_frame)
+                loss_small = torch.nn.functional.binary_cross_entropy(y_small["out"][:, 0, :, :], small_trace, reduction="sum")
+                loss_small2 = torch.nn.functional.binary_cross_entropy(y_small["out2"][:, 0, :, :], small_trace, reduction="sum")
+                loss_small3 = torch.nn.functional.binary_cross_entropy(y_small["out3"][:, 0, :, :], small_trace, reduction="sum")
+                loss_small4 = torch.nn.functional.binary_cross_entropy(y_small["out4"][:, 0, :, :], small_trace, reduction="sum")
+                y_small = (y_small["out"] + y_small["out2"] + y_small["out3"] + y_small["out4"]) * 0.25
+                # Compute pixel intersection and union between human and computer segmentations
+                small_inter += np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                small_union += np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                small_inter_list.extend(np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+                small_union_list.extend(np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+
+                # Take gradient step if training
+                loss_supervised = (loss_large + loss_large2 + loss_large3 + loss_large4 + 
+                                    loss_small + loss_small2 + loss_small3 + loss_small4)
+                loss_supervised = loss_supervised/8
+
+                """
+                Unlabelled Step Forward
+                """
+                (_, (large_frame_ul, small_frame_ul, _1, _2)) = dataloader_ul_iter.next()
+                large_frame_ul = large_frame_ul.to(device)
+                
+                with torch.set_grad_enabled(False):
+                    y_large_pseudo = model(large_frame_ul)
+                    y_large_pseudo_mean = (y_large_pseudo["out"] + y_large_pseudo["out2"] + y_large_pseudo["out3"] + y_large_pseudo["out4"]) * 0.25
+                #Get one with different dropout
+                y_large_pseudo = model(large_frame_ul)
+                loss_large_pseudo = torch.nn.functional.binary_cross_entropy(y_large_pseudo["out"], y_large_pseudo_mean, reduction="sum")
+                loss_large_pseudo2 = torch.nn.functional.binary_cross_entropy(y_large_pseudo["out2"], y_large_pseudo_mean, reduction="sum")
+                loss_large_pseudo3 = torch.nn.functional.binary_cross_entropy(y_large_pseudo["out3"], y_large_pseudo_mean, reduction="sum")
+                loss_large_pseudo4 = torch.nn.functional.binary_cross_entropy(y_large_pseudo["out4"], y_large_pseudo_mean, reduction="sum")
+
+                small_frame_ul = small_frame_ul.to(device)
+
+                with torch.set_grad_enabled(False):
+                    y_small_pseudo = model(small_frame_ul)
+                    y_small_pseudo_mean = (y_small_pseudo["out"] + y_small_pseudo["out2"] + y_small_pseudo["out3"] + y_small_pseudo["out4"]) * 0.25
+                #Get one with different dropout
+                y_small_pseudo = model(small_frame_ul)
+                loss_small_pseudo = torch.nn.functional.binary_cross_entropy(y_small_pseudo["out"], y_small_pseudo_mean, reduction="sum")
+                loss_small_pseudo2 = torch.nn.functional.binary_cross_entropy(y_small_pseudo["out2"], y_small_pseudo_mean, reduction="sum")
+                loss_small_pseudo3 = torch.nn.functional.binary_cross_entropy(y_small_pseudo["out3"], y_small_pseudo_mean, reduction="sum")
+                loss_small_pseudo4 = torch.nn.functional.binary_cross_entropy(y_small_pseudo["out4"], y_small_pseudo_mean, reduction="sum")
+
+                loss_pseudo = (loss_large_pseudo + loss_large_pseudo2 + loss_large_pseudo3 + loss_large_pseudo4 + 
+                                loss_small_pseudo + loss_small_pseudo2 + loss_small_pseudo3 + loss_small_pseudo4)
+                loss_pseudo = loss_pseudo / 8
+                
+                loss = loss_supervised + w_cps * loss_pseudo
+                if train:
+                    optim.zero_grad()
+                    loss.backward()
+                    optim.step()
+
+                # Accumulate losses and compute baselines
+                total += loss_supervised.item()
+                n += large_trace.size(0)
+                p = pos / (pos + neg)
+                p_pix = (pos_pix + 1) / (pos_pix + neg_pix + 2)
+
+                # Show info on process bar
+                pbar.set_postfix_str("{:.4f} ({:.4f}) / {:.4f} {:.4f}, {:.4f}, {:.4f}".format(total / n / 112 / 112, loss.item() / large_trace.size(0) / 112 / 112, -p * math.log(p) - (1 - p) * math.log(1 - p), (-p_pix * np.log(p_pix) - (1 - p_pix) * np.log(1 - p_pix)).mean(), 2 * large_inter / (large_union + large_inter), 2 * small_inter / (small_union + small_inter)))
+
+    large_inter_list = np.array(large_inter_list)
+    large_union_list = np.array(large_union_list)
+    small_inter_list = np.array(small_inter_list)
+    small_union_list = np.array(small_union_list)
+
+    return (total / n / 112 / 112,
+            large_inter_list,
+            large_union_list,
+            small_inter_list,
+            small_union_list,
+            )
+
+def run_epoch_val(model, dataloader, device):
+    """Run one epoch of training/evaluation for segmentation.
+
+    Args:
+        model (torch.nn.Module): Model to train/evaulate.
+        dataloder (torch.utils.data.DataLoader): Dataloader for dataset.
+        train (bool): Whether or not to train model.
+        optim (torch.optim.Optimizer): Optimizer
+        device (torch.device): Device to run on
+    """
+
+    total = 0.
+    n = 0
+
+    pos = 0
+    neg = 0
+    pos_pix = 0
+    neg_pix = 0
+
+    model.train(False)
+
+    large_inter = 0
+    large_union = 0
+    small_inter = 0
+    small_union = 0
+    large_inter_list = []
+    large_union_list = []
+    small_inter_list = []
+    small_union_list = []
+
+    with torch.set_grad_enabled(False):
         with tqdm.tqdm(total=len(dataloader)) as pbar:
             for (_, (large_frame, small_frame, large_trace, small_trace)) in dataloader:
                 # Count number of pixels in/out of human segmentation
@@ -411,31 +574,37 @@ def run_epoch(model, dataloader, train, optim, device):
                 # Run prediction for diastolic frames and compute loss
                 large_frame = large_frame.to(device)
                 large_trace = large_trace.to(device)
-                y_large = model(large_frame)["out"]
-                loss_large = torch.nn.functional.binary_cross_entropy_with_logits(y_large[:, 0, :, :], large_trace, reduction="sum")
+                y_large = model(large_frame)
+                loss_large = torch.nn.functional.binary_cross_entropy(y_large["out"][:, 0, :, :], large_trace, reduction="sum")
+                loss_large2 = torch.nn.functional.binary_cross_entropy(y_large["out2"][:, 0, :, :], large_trace, reduction="sum")
+                loss_large3 = torch.nn.functional.binary_cross_entropy(y_large["out3"][:, 0, :, :], large_trace, reduction="sum")
+                loss_large4 = torch.nn.functional.binary_cross_entropy(y_large["out4"][:, 0, :, :], large_trace, reduction="sum")
+                y_large = (y_large["out"] + y_large["out2"] + y_large["out3"] + y_large["out4"]) * 0.25
                 # Compute pixel intersection and union between human and computer segmentations
-                large_inter += np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0., large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
-                large_union += np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0., large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
-                large_inter_list.extend(np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0., large_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
-                large_union_list.extend(np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0., large_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
-
+                large_inter += np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                large_union += np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                large_inter_list.extend(np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+                large_union_list.extend(np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
                 # Run prediction for systolic frames and compute loss
                 small_frame = small_frame.to(device)
                 small_trace = small_trace.to(device)
-                y_small = model(small_frame)["out"]
-                loss_small = torch.nn.functional.binary_cross_entropy_with_logits(y_small[:, 0, :, :], small_trace, reduction="sum")
+                
+                y_small = model(small_frame)
+                loss_small = torch.nn.functional.binary_cross_entropy(y_small["out"][:, 0, :, :], small_trace, reduction="sum")
+                loss_small2 = torch.nn.functional.binary_cross_entropy(y_small["out2"][:, 0, :, :], small_trace, reduction="sum")
+                loss_small3 = torch.nn.functional.binary_cross_entropy(y_small["out3"][:, 0, :, :], small_trace, reduction="sum")
+                loss_small4 = torch.nn.functional.binary_cross_entropy(y_small["out4"][:, 0, :, :], small_trace, reduction="sum")
+                y_small = (y_small["out"] + y_small["out2"] + y_small["out3"] + y_small["out4"]) * 0.25
                 # Compute pixel intersection and union between human and computer segmentations
-                small_inter += np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0., small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
-                small_union += np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0., small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
-                small_inter_list.extend(np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0., small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
-                small_union_list.extend(np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0., small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+                small_inter += np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                small_union += np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
+                small_inter_list.extend(np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+                small_union_list.extend(np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
 
                 # Take gradient step if training
-                loss = (loss_large + loss_small) / 2
-                if train:
-                    optim.zero_grad()
-                    loss.backward()
-                    optim.step()
+                loss_supervised = (loss_large + loss_large2 + loss_large3 + loss_large4 + loss_small + loss_small2 + loss_small3 + loss_small4)
+                loss_supervised = loss_supervised/8
+                loss = loss_supervised
 
                 # Accumulate losses and compute baselines
                 total += loss.item()
@@ -445,7 +614,6 @@ def run_epoch(model, dataloader, train, optim, device):
 
                 # Show info on process bar
                 pbar.set_postfix_str("{:.4f} ({:.4f}) / {:.4f} {:.4f}, {:.4f}, {:.4f}".format(total / n / 112 / 112, loss.item() / large_trace.size(0) / 112 / 112, -p * math.log(p) - (1 - p) * math.log(1 - p), (-p_pix * np.log(p_pix) - (1 - p_pix) * np.log(1 - p_pix)).mean(), 2 * large_inter / (large_union + large_inter), 2 * small_inter / (small_union + small_inter)))
-                pbar.update()
 
     large_inter_list = np.array(large_inter_list)
     large_union_list = np.array(large_union_list)
@@ -458,7 +626,6 @@ def run_epoch(model, dataloader, train, optim, device):
             small_inter_list,
             small_union_list,
             )
-
 
 def _video_collate_fn(x):
     """Collate function for Pytorch dataloader to merge multiple videos.

@@ -107,6 +107,9 @@ def run(
     num_of_gpus = torch.cuda.device_count()
     print("Available gpus: " + str(num_of_gpus))
 
+    y_mean = 55.32 #calculated elsewhere
+    y_std = 12.70 #calculated elsewhere
+
     # Seed RNGs
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -125,7 +128,6 @@ def run(
     model = torchvision.models.video.__dict__[model_name](pretrained=pretrained)
 
     model.fc = torch.nn.Linear(model.fc.in_features, 1)
-    model.fc.bias.data[0] = 55.6
     if device.type == "cuda":
         model = torch.nn.DataParallel(model)
     model.to(device)
@@ -135,7 +137,7 @@ def run(
         model.load_state_dict(checkpoint['state_dict'])
 
     # Set up optimizer
-    optim = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    optim = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if lr_step_period is None:
         lr_step_period = math.inf
     scheduler = torch.optim.lr_scheduler.StepLR(optim, lr_step_period)
@@ -185,7 +187,7 @@ def run(
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
                 print("Running epoch: {}, split: {}".format(epoch, phase))
-                loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device)
+                loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device, y_mean = y_mean, y_std=y_std)
                 f.write("{},{},{},{},{},{},{},{},{}\n".format(epoch,
                                                               phase,
                                                               loss,
@@ -214,6 +216,12 @@ def run(
             if loss < bestLoss:
                 torch.save(save, os.path.join(output, "best.pt"))
                 bestLoss = loss
+                no_improvement = 0
+            else:
+                #Early Stopping to save some time and compute resources
+                no_improvement += 1
+                if no_improvement >= 3:
+                    break
 
         # Load best weights
         if num_epochs != 0:
@@ -229,7 +237,7 @@ def run(
                 dataloader = torch.utils.data.DataLoader(
                     echonet.datasets.Echo(root=data_dir, split=split, **kwargs),
                     batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"))
-                loss, yhat, y = run_epoch(model, dataloader, False, None, device)
+                loss, yhat, y = run_epoch(model, dataloader, False, None, device, y_mean = y_mean, y_std=y_std)
                 f.write("{} (one clip) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.r2_score)))
                 f.write("{} (one clip) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_absolute_error)))
                 f.write("{} (one clip) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_squared_error)))))
@@ -239,7 +247,7 @@ def run(
                 ds = echonet.datasets.Echo(root=data_dir, split=split, **kwargs, clips="all")
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=1, num_workers=0, shuffle=False, pin_memory=(device.type == "cuda"))
-                loss, yhat, y = run_epoch(model, dataloader, False, None, device, save_all=True, block_size=batch_size)
+                loss, yhat, y = run_epoch(model, dataloader, False, None, device, save_all=True, block_size=batch_size, y_mean = y_mean, y_std=y_std)
                 f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
                 f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
                 f.write("{} (all clips) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_squared_error)))))
@@ -286,9 +294,8 @@ def run(
                 plt.close(fig)
 
 
-def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None):
+def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None, y_mean = 1, y_std = 0):
     """Run one epoch of training/evaluation for segmentation.
-
     Args:
         model (torch.nn.Module): Model to train/evaulate.
         dataloder (torch.utils.data.DataLoader): Dataloader for dataset.
@@ -304,7 +311,8 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
             used. If None, always run on all augmentations simultaneously.
             Default is None.
     """
-
+    print(f"y_mean is{y_mean}")
+    print(f"y_std is {y_std}")
     model.train(train)
 
     total = 0  # total training loss
@@ -322,7 +330,7 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                 y.append(outcome.numpy())
                 X = X.to(device)
                 outcome = outcome.to(device)
-
+                outcome = (outcome - y_mean)/y_std
                 average = (len(X.shape) == 6)
                 if average:
                     batch, n_clips, c, f, h, w = X.shape
@@ -335,16 +343,18 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                     outputs = model(X)
                 else:
                     outputs = torch.cat([model(X[j:(j + block_size), ...]) for j in range(0, X.shape[0], block_size)])
+                
+                yhat_o = (outputs*y_std+y_mean).view(-1).to("cpu").detach().numpy()
 
                 if save_all:
-                    yhat.append(outputs.view(-1).to("cpu").detach().numpy())
+                    yhat.append(yhat_o)
 
                 if average:
                     outputs = outputs.view(batch, n_clips, -1).mean(1)
 
                 if not save_all:
-                    yhat.append(outputs.view(-1).to("cpu").detach().numpy())
-
+                    yhat.append(yhat_o)
+                
                 loss = torch.nn.functional.mse_loss(outputs.view(-1), outcome)
 
                 if train:

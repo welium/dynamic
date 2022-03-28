@@ -95,7 +95,6 @@ def run(
             Defaults to 20.
         seed (int, optional): Seed for random number generator. Defaults to 0.
     """
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
     num_of_gpus = torch.cuda.device_count()
     print("Available gpus: " + str(num_of_gpus))
 
@@ -127,7 +126,7 @@ def run(
         model.load_state_dict(checkpoint['state_dict'])
 
     # Set up optimizer
-    optim = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    optim = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if lr_step_period is None:
         lr_step_period = math.inf
     scheduler = torch.optim.lr_scheduler.StepLR(optim, lr_step_period)
@@ -175,8 +174,8 @@ def run(
                 ds = dataset[phase]
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
-                print("Running epoch: {}, split: {}".format(epoch, split))
-                loss, large_inter, large_union, small_inter, small_union = echonet.utils.segmentation.run_epoch(model, dataloader, phase == "train", optim, device)
+                print("Running epoch: {}, split: {}".format(epoch, phase))
+                loss, large_inter, large_union, small_inter, small_union = run_epoch(model, dataloader, phase == "train", optim, device)
                 overall_dice = 2 * (large_inter.sum() + small_inter.sum()) / (large_union.sum() + large_inter.sum() + small_union.sum() + small_inter.sum())
                 large_dice = 2 * large_inter.sum() / (large_union.sum() + large_inter.sum())
                 small_dice = 2 * small_inter.sum() / (small_union.sum() + small_inter.sum())
@@ -207,6 +206,14 @@ def run(
             if loss < bestLoss:
                 torch.save(save, os.path.join(output, "best.pt"))
                 bestLoss = loss
+                no_improvement = 0
+            else:
+                #Early Stopping to save some time and compute resources
+                no_improvement += 1
+                if no_improvement >= 3:
+                    epoch = num_epochs
+                    print("Early Stopping as val loss stop improving")
+                    f.write("Early Stopping as val loss stop improving")
 
         # Load best weights
         if num_epochs != 0:
@@ -221,7 +228,7 @@ def run(
                 dataloader = torch.utils.data.DataLoader(dataset,
                                                          batch_size=batch_size, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
                 print("Running epoch: {}, split: {}".format(checkpoint["epoch"], split))
-                loss, large_inter, large_union, small_inter, small_union = echonet.utils.segmentation.run_epoch(model, dataloader, False, None, device)
+                loss, large_inter, large_union, small_inter, small_union = run_epoch(model, dataloader, False, None, device)
 
                 overall_dice = 2 * (large_inter + small_inter) / (large_union + large_inter + small_union + small_inter)
                 large_dice = 2 * large_inter / (large_union + large_inter)
