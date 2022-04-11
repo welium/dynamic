@@ -11,11 +11,12 @@ import scipy.signal
 import skimage.draw
 import torch
 import tqdm
-from .models.deeplab_4d import deeplabv3_resnet50
+from .models.deeplab_2d import deeplabv3_resnet50
+from .loss import mse_var_loss, ul_var_loss
 
 echonet = __import__(__name__.split('.')[0])
 
-@click.command("segmentation_new")
+@click.command("segmentation_unc")
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
 @click.option("--output", type=click.Path(file_okay=False), default=None)
 @click.option("--model_name", type=str, default="deeplabv3_ss")
@@ -33,7 +34,9 @@ echonet = __import__(__name__.split('.')[0])
 @click.option("--seed", type=int, default=0)
 @click.option("--drop_rate", type=float, default=0.2)
 @click.option("--w_cps", type=float, default=0.5)
-@click.option("--constant_wcps/--increasing_wcps", default=True)
+@click.option("--w_aliv", type=float, default=0.5)
+@click.option("--samp_ssl", type=int, default=3)
+
 def run(
     data_dir=None,
     output=None,
@@ -54,8 +57,8 @@ def run(
     seed=0,
     drop_rate = 0.2,
     w_cps=0.5,
-    constant_wcps=True,
-    
+    w_aliv=0.5,
+    samp_ssl=3,
 ):
     """Trains/tests segmentation model.
 
@@ -120,7 +123,9 @@ def run(
 
     if device.type == "cuda":
         model = torch.nn.DataParallel(model)
-    model.to(device)    
+    model.to(device)
+
+    
 
     if weights is not None:
         checkpoint = torch.load(weights)
@@ -152,7 +157,6 @@ def run(
     with open(os.path.join(output, "log.csv"), "a") as f:
         epoch_resume = 0
         bestLoss = float("inf")
-        bestDice = 0
         try:
             # Attempt to load checkpoint
             checkpoint = torch.load(os.path.join(output, "checkpoint.pt"))
@@ -161,14 +165,12 @@ def run(
             scheduler.load_state_dict(checkpoint['scheduler_dict'])
             epoch_resume = checkpoint["epoch"] + 1
             bestLoss = checkpoint["best_loss"]
-            bestDice = checkpoint["best_dice"]
-            overall_dice = checkpoint["dice"]
             f.write("Resuming from epoch {}\n".format(epoch_resume))
         except FileNotFoundError:
             f.write("Starting run from scratch\n")
         no_improvement = 0
         for epoch in range(epoch_resume, num_epochs):
-            if no_improvement >= 4:
+            if no_improvement >= 3:
                 print("Early Stopping as there is no improvement")
                 f.write("Early Stopping as there is no improvement\n")
                 break
@@ -188,11 +190,8 @@ def run(
                     dataloader = torch.utils.data.DataLoader(
                         ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
                     print("Running epoch: {}, split: {}".format(epoch, phase))
-                    w_c = w_cps
-                    if not(constant_wcps):
-                        w_c = min(0.1*epoch, w_cps)
-                    print(f"Using w_cps: {w_c} for this epoch of training")
-                    loss, large_inter, large_union, small_inter, small_union = run_epoch(model, dataloader, dataloader_ul, phase == "train", optim, device, w_cps=w_c)
+                    loss, large_inter, large_union, small_inter, small_union = run_epoch(model, dataloader, dataloader_ul, phase == "train", optim, device, 
+                                                                                        w_cps=w_cps, w_aliv=w_aliv, samp_ssl=samp_ssl)
                 else:
                     dataloader = torch.utils.data.DataLoader(
                         ds, batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"), drop_last=(phase == "train"))
@@ -224,15 +223,11 @@ def run(
                 'loss': loss,
                 'opt_dict': optim.state_dict(),
                 'scheduler_dict': scheduler.state_dict(),
-                'best_dice': bestDice,
-                'dice': overall_dice
             }
             torch.save(save, os.path.join(output, "checkpoint.pt"))
             if loss < bestLoss:
-                bestLoss = loss                
-            if overall_dice > bestDice:
-                bestDice = overall_dice
                 torch.save(save, os.path.join(output, "best.pt"))
+                bestLoss = loss
                 no_improvement = 0
             else: 
                 no_improvement += 1
@@ -392,7 +387,7 @@ def run(
                         start += offset
 
 
-def run_epoch(model, dataloader, dataloader_ul, train, optim, device, w_cps = 0.5):
+def run_epoch(model, dataloader, dataloader_ul, train, optim, device, w_cps = 0.5, w_aliv=0.5, samp_ssl=3):
     """Run one epoch of training/evaluation for segmentation.
 
     Args:
@@ -449,12 +444,11 @@ def run_epoch(model, dataloader, dataloader_ul, train, optim, device, w_cps = 0.
                 large_frame = large_frame.to(device)
                 large_trace = large_trace.to(device)
                 y_large = model(large_frame)
-                loss_fn = torch.nn.MSELoss(reduction='sum')
-                loss_large = loss_fn(y_large["out"][:, 0, :, :], large_trace)
-                loss_large2 = loss_fn(y_large["out2"][:, 0, :, :], large_trace)
-                loss_large3 = loss_fn(y_large["out3"][:, 0, :, :], large_trace)
-                loss_large4 = loss_fn(y_large["out4"][:, 0, :, :], large_trace)
-                y_large = (y_large["out"] + y_large["out2"] + y_large["out3"] + y_large["out4"]) * 0.25
+                mean_1, var_1 = (y_large["out"], y_large["out2"])
+                loss_fn = torch.nn.MSELoss(reduction = "sum")
+                loss_large1 = loss_fn(mean_1[:, 0, :, :], large_trace)
+                loss_large_var1 = mse_var_loss(mean_1[:, 0, :, :], var_1[:, 0, :, :], large_trace)
+                y_large = mean_1
                 # Compute pixel intersection and union between human and computer segmentations
                 large_inter += np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
                 large_union += np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
@@ -465,55 +459,27 @@ def run_epoch(model, dataloader, dataloader_ul, train, optim, device, w_cps = 0.
                 small_trace = small_trace.to(device)
                 
                 y_small = model(small_frame)
-                loss_small = loss_fn(y_small["out"][:, 0, :, :], small_trace)
-                loss_small2 = loss_fn(y_small["out2"][:, 0, :, :], small_trace)
-                loss_small3 = loss_fn(y_small["out3"][:, 0, :, :], small_trace)
-                loss_small4 = loss_fn(y_small["out4"][:, 0, :, :], small_trace)
-                y_small = (y_small["out"] + y_small["out2"] + y_small["out3"] + y_small["out4"]) * 0.25
+                mean_1, var_1= (y_small["out"], y_small["out2"])
+                loss_small1 = loss_fn(mean_1[:, 0, :, :], small_trace)
+                loss_small_var1 = mse_var_loss(mean_1[:, 0, :, :], var_1[:, 0, :, :], small_trace)
+                y_small = mean_1
                 # Compute pixel intersection and union between human and computer segmentations
                 small_inter += np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
                 small_union += np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
                 small_inter_list.extend(np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
                 small_union_list.extend(np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
+                # Computer overall loss for supervised loss
+                loss_supervised = (loss_large1+loss_small1) + \
+                    w_aliv*(loss_large_var1+loss_small_var1)
 
-                # Take gradient step if training
-                loss_supervised = (loss_large + loss_large2 + loss_large3 + loss_large4 + 
-                                    loss_small + loss_small2 + loss_small3 + loss_small4)
-                loss_supervised = loss_supervised/8
-
-                """
+                '''
                 Unlabelled Step Forward
-                """
-                (_, (large_frame_ul, small_frame_ul, _1, _2)) = dataloader_ul_iter.next()
-                large_frame_ul = large_frame_ul.to(device)
-                
-                with torch.set_grad_enabled(False):
-                    y_large_pseudo = model(large_frame_ul)
-                    y_large_pseudo_mean = (y_large_pseudo["out"] + y_large_pseudo["out2"] + y_large_pseudo["out3"] + y_large_pseudo["out4"]) * 0.25
-                #Get one with different dropout
-                y_large_pseudo = model(large_frame_ul)
-                loss_large_pseudo = loss_fn(y_large_pseudo["out"], y_large_pseudo_mean)
-                loss_large_pseudo2 = loss_fn(y_large_pseudo["out2"], y_large_pseudo_mean)
-                loss_large_pseudo3 = loss_fn(y_large_pseudo["out3"], y_large_pseudo_mean)
-                loss_large_pseudo4 = loss_fn(y_large_pseudo["out4"], y_large_pseudo_mean)
+                '''
+                # (_, (large_frame, small_frame, _1, _2)) = dataloader_iter.next()
+                # for i in range(samp_ssl):
+                    
 
-                small_frame_ul = small_frame_ul.to(device)
-
-                with torch.set_grad_enabled(False):
-                    y_small_pseudo = model(small_frame_ul)
-                    y_small_pseudo_mean = (y_small_pseudo["out"] + y_small_pseudo["out2"] + y_small_pseudo["out3"] + y_small_pseudo["out4"]) * 0.25
-                #Get one with different dropout
-                y_small_pseudo = model(small_frame_ul)
-                loss_small_pseudo = loss_fn(y_small_pseudo["out"], y_small_pseudo_mean)
-                loss_small_pseudo2 = loss_fn(y_small_pseudo["out2"], y_small_pseudo_mean)
-                loss_small_pseudo3 = loss_fn(y_small_pseudo["out3"], y_small_pseudo_mean)
-                loss_small_pseudo4 = loss_fn(y_small_pseudo["out4"], y_small_pseudo_mean)
-
-                loss_pseudo = (loss_large_pseudo + loss_large_pseudo2 + loss_large_pseudo3 + loss_large_pseudo4 + 
-                                loss_small_pseudo + loss_small_pseudo2 + loss_small_pseudo3 + loss_small_pseudo4)
-                loss_pseudo = loss_pseudo / 8
-                
-                loss = loss_supervised + w_cps * loss_pseudo
+                loss = loss_supervised
                 if train:
                     optim.zero_grad()
                     loss.backward()
@@ -574,7 +540,6 @@ def run_epoch_val(model, dataloader, device):
         with tqdm.tqdm(total=len(dataloader)) as pbar:
             for (_, (large_frame, small_frame, large_trace, small_trace)) in dataloader:
                 # Count number of pixels in/out of human segmentation
-                loss_fn = torch.nn.MSELoss(reduction='sum')
                 pos += (large_trace == 1).sum().item()
                 pos += (small_trace == 1).sum().item()
                 neg += (large_trace == 0).sum().item()
@@ -587,14 +552,12 @@ def run_epoch_val(model, dataloader, device):
                 neg_pix += (small_trace == 0).sum(0).to("cpu").detach().numpy()
 
                 # Run prediction for diastolic frames and compute loss
+                loss_fn = torch.nn.MSELoss(reduction="sum")
                 large_frame = large_frame.to(device)
                 large_trace = large_trace.to(device)
                 y_large = model(large_frame)
                 loss_large = loss_fn(y_large["out"][:, 0, :, :], large_trace)
-                loss_large2 = loss_fn(y_large["out2"][:, 0, :, :], large_trace)
-                loss_large3 = loss_fn(y_large["out3"][:, 0, :, :], large_trace)
-                loss_large4 = loss_fn(y_large["out4"][:, 0, :, :], large_trace)
-                y_large = (y_large["out"] + y_large["out2"] + y_large["out3"] + y_large["out4"]) * 0.25
+                y_large = y_large["out"]
                 # Compute pixel intersection and union between human and computer segmentations
                 large_inter += np.logical_and(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
                 large_union += np.logical_or(y_large[:, 0, :, :].detach().cpu().numpy() > 0.5, large_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
@@ -606,10 +569,7 @@ def run_epoch_val(model, dataloader, device):
                 
                 y_small = model(small_frame)
                 loss_small = loss_fn(y_small["out"][:, 0, :, :], small_trace)
-                loss_small2 = loss_fn(y_small["out2"][:, 0, :, :], small_trace)
-                loss_small3 = loss_fn(y_small["out3"][:, 0, :, :], small_trace)
-                loss_small4 = loss_fn(y_small["out4"][:, 0, :, :], small_trace)
-                y_small = (y_small["out"] + y_small["out2"] + y_small["out3"] + y_small["out4"]) * 0.25
+                y_small = y_small["out"]
                 # Compute pixel intersection and union between human and computer segmentations
                 small_inter += np.logical_and(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
                 small_union += np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum()
@@ -617,8 +577,8 @@ def run_epoch_val(model, dataloader, device):
                 small_union_list.extend(np.logical_or(y_small[:, 0, :, :].detach().cpu().numpy() > 0.5, small_trace[:, :, :].detach().cpu().numpy() > 0.).sum((1, 2)))
 
                 # Take gradient step if training
-                loss_supervised = (loss_large + loss_large2 + loss_large3 + loss_large4 + loss_small + loss_small2 + loss_small3 + loss_small4)
-                loss_supervised = loss_supervised/8
+                loss_supervised = (loss_large + loss_small)
+                loss_supervised = loss_supervised/2
                 loss = loss_supervised
 
                 # Accumulate losses and compute baselines

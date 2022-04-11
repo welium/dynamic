@@ -19,6 +19,7 @@ def main():
 del click
 
 main.add_command(utils.new.segmentation.run)
+main.add_command(utils.new.segmentation_unc.run)
 main.add_command(utils.new.video.run)
 main.add_command(utils.original.segmentation.run)
 main.add_command(utils.original.video.run)

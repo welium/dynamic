@@ -51,6 +51,7 @@ class DeepLabV3_4decoders(nn.Module):
         x2 = self.classifier2(x2)
         x2 = F.interpolate(x2, size=input_shape, mode='bicubic', align_corners=False)
         x2 = torch.sigmoid(x2)
+
         result["out2"] = x2
 
         x3 = nn.functional.dropout(features, p=self.drop_rate)
@@ -144,9 +145,9 @@ def _deeplabv3_resnet(
     return_layers = {"layer4": "out"}
     backbone = IntermediateLayerGetter(backbone, return_layers=return_layers)
     classifier = DeepLabHead(2048, num_classes)
-    classifier2 = DeepLabHead(2048, num_classes)
+    classifier2 = FCNHead(2048, num_classes)
     classifier3 = DeepLabHead(2048, num_classes)
-    classifier4 = DeepLabHead(2048, num_classes)
+    classifier4 = FCNHead(2048, num_classes)
 
     return DeepLabV3_4decoders(backbone, classifier, classifier2, classifier3, classifier4, **kwargs)
 

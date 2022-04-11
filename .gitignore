@@ -7,3 +7,4 @@ echonet.cfg
 echonet.egg-info/
 a4c-video-dir
 output/
+build/

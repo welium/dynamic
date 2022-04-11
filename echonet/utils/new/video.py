@@ -133,15 +133,17 @@ def run(
 
     # Set up model
     model = r2plus1d_18_unc(num_classes=1, pretrained=pretrained, drop_rate=drop_rate)
-    model.to(device)
     print("Bias of fc_1 in model is :{:.2f}".format(model.fc_1.bias.data[0]))
 
     model_1 = r2plus1d_18_unc(num_classes=1, pretrained=pretrained, drop_rate=drop_rate)
-    model_1.to(device)
     print("Bias of fc_1 in model1 is :{:.2f}".format(model_1.fc_1.bias.data[0]))
     if device.type == "cuda":
         model = torch.nn.DataParallel(model)
         model_1 = torch.nn.DataParallel(model_1)
+        
+    model.to(device)
+    model_1.to(device)
+
    
     if weights is not None:
         checkpoint = torch.load(weights)
