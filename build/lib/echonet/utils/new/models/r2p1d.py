@@ -8,7 +8,8 @@ from typing import Tuple, Optional, Callable, List, Sequence, Type, Any, Union
 import torch.nn as nn
 from torch import Tensor
 
-from torch.hub import load_state_dict_from_url
+from torchvision.models.utils import load_state_dict_from_url
+
 __all__ = ["r3d_18", "mc3_18", "r2plus1d_18"]
 
 model_urls = {
