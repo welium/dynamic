@@ -6,15 +6,18 @@ EchoNet-Dynamic:<br/>Interpretable AI for beat-to-beat cardiac function assessme
 In this project, we will develop artificial intelligence methods to predict the ejection fraction and thereby assess cardiomyopathy. This project implement a semi-supervised approach to the project compared to the supervised approach. We seek to improve the performace of the model with unlabelled data
 
 Video Regression (prediction of ejection fraction by entire video)
-|    | Baseline| Ours (CPS=0.5)|
-| r2 | 0.553   | 0.598         |
+|         | Baseline| Ours (CPS=0.5)|
+| ------- | --------| ------------- |
+| r2      | 0.553   | 0.598         |
 
 Image Segmentation (semantic segmentation of the left ventricle)
 |      | Baseline| Ours  |
+| ---- | --------| ----- |
 | Dice | 0.911   | 0.921 |
 
 Classification (assessment of cardiomyopathy with reduced ejection fraction.)
 |         | Baseline| Ours  |
+| ------- | --------| ----- |
 | AUC ROC | 0.939   | 0.946 |
 
 ------------------------------------------------------------------------------
